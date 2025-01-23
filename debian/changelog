@@ -1,0 +1,5 @@
+golang-github-google-go-tpm-tools (0.4.4-1) UNRELEASED; urgency=medium
+
+  * Initial release (Closes: TODO)
+
+ -- Simon Josefsson <simon@josefsson.org>  Thu, 23 Jan 2025 08:39:32 +0100
