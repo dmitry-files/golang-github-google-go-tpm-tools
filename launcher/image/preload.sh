@@ -77,6 +77,8 @@ configure_node_problem_detector() {
 configure_systemd_units_for_debug() {
   configure_cloud_logging
   configure_node_problem_detector
+
+  disable_unit "konlet-startup.service"
 }
 configure_systemd_units_for_hardened() {
   configure_necessary_systemd_units
@@ -128,6 +130,16 @@ main() {
          "Only 'debug' and 'hardened' are supported."
     exit 1
   fi
+
+  # Make sure cache is flushed for the OEM partition.
+  sync ${OEM_PATH}
+
+  # Remount as read-only to avoid unexpected changes
+  mount -o remount,ro ${OEM_PATH}
+
+  # Verify the content before the OEM sealing step.
+  ls -lh ${CS_PATH}
+  ls -lh ${OEM_PATH}
 }
 
 main

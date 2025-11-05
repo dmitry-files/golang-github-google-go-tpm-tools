@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -13,8 +14,9 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm-tools/internal/util"
 	"github.com/google/go-tpm-tools/verifier"
+	"github.com/google/go-tpm-tools/verifier/models"
+	"github.com/google/go-tpm-tools/verifier/util"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/spf13/cobra"
 	"google.golang.org/api/option"
@@ -54,7 +56,7 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 			return fmt.Errorf("failed to fetch Region from MDS, the tool is probably not running in a GCE VM: %v", err)
 		}
 
-		projectID, err := mdsClient.ProjectID()
+		projectID, err := mdsClient.ProjectIDWithContext(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve ProjectID from MDS: %v", err)
 		}
@@ -90,7 +92,7 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 				return errors.New("cloud logging requires the --audience flag")
 			}
 			if mockCloudLoggingServerAddress != "" {
-				conn, err := grpc.Dial(mockCloudLoggingServerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				conn, err := grpc.NewClient(mockCloudLoggingServerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 				if err != nil {
 					log.Fatalf("dialing %q: %v", mockCloudLoggingServerAddress, err)
 				}
@@ -106,12 +108,12 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 			}
 
 			cloudLogger = cloudLogClient.Logger(toolName)
-			fmt.Fprintf(debugOutput(), "cloudLogger created for project: "+projectID+"\n")
+			fmt.Fprintf(debugOutput(), "cloudLogger created for project: %s\n", projectID)
 		}
 
 		key = "gceAK"
 
-		fmt.Fprintf(debugOutput(), "Fetching attestation verifier OIDC token\n")
+		fmt.Fprint(debugOutput(), "Fetching attestation verifier OIDC token\n")
 
 		challenge, err := verifierClient.CreateChallenge(ctx)
 		if err != nil {
@@ -123,16 +125,21 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 			return fmt.Errorf("failed to get principal tokens: %w", err)
 		}
 
-		attestation, err := util.FetchAttestation(rwc, attestationKeys[key][keyAlgo], challenge.Nonce)
+		ak, err := attestationKeys[key][keyAlgo](rwc)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get an AK: %w", err)
 		}
+		attestation, err := ak.Attest(client.AttestOpts{Nonce: challenge.Nonce, CertChainFetcher: http.DefaultClient})
+		if err != nil {
+			return fmt.Errorf("failed to attest: %v", err)
+		}
+		ak.Close()
 
 		req := verifier.VerifyAttestationRequest{
 			Challenge:      challenge,
 			GcpCredentials: principalTokens,
 			Attestation:    attestation,
-			TokenOptions:   verifier.TokenOptions{CustomAudience: audience, TokenType: "OIDC"},
+			TokenOptions:   &models.TokenOptions{Audience: audience, Nonces: customNonce, TokenType: "OIDC"},
 		}
 
 		resp, err := verifierClient.VerifyAttestation(ctx, req)
@@ -169,7 +176,7 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 		}
 
 		if output == "" {
-			fmt.Fprintf(messageOutput(), string(token)+"\n")
+			fmt.Fprintf(messageOutput(), "%s\n", string(token))
 		} else {
 			out := []byte(token)
 			if _, err := dataOutput().Write(out); err != nil {
@@ -188,7 +195,7 @@ The OIDC token includes claims regarding the GCE VM, which is verified by Attest
 			}
 		}
 
-		fmt.Fprintf(debugOutput(), string(claimsString)+"\n"+"Note: these Claims are for debugging purpose and not verified"+"\n")
+		fmt.Fprintf(debugOutput(), "%s\nNote: these Claims are for debugging purpose and not verified\n", string(claimsString))
 
 		return nil
 	},
@@ -201,6 +208,8 @@ func init() {
 	addAsAddressFlag(tokenCmd)
 	addCloudLoggingFlag(tokenCmd)
 	addAudienceFlag(tokenCmd)
+	addEventLogFlag(tokenCmd)
+	addCustomNonceFlag(tokenCmd)
 	// TODO: Add TEE hardware OIDC token generation
 	// addTeeNonceflag(tokenCmd)
 	// addTeeTechnology(tokenCmd)
