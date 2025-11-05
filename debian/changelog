@@ -1,5 +1,7 @@
-golang-github-google-go-tpm-tools (0.4.4-1) unstable; urgency=medium
+golang-github-google-go-tpm-tools (0.4.6-1) unstable; urgency=medium
 
-  * Initial release (Closes: #1093838)
+  * Initial release (Closes: #1093838: ITP:
+    golang-github-google-go-tpm-tools -- high-level library API
+    for using TPMs)
 
- -- Simon Josefsson <simon@josefsson.org>  Thu, 23 Jan 2025 08:39:32 +0100
+ -- Dmitry <debian@dmitry.ms>  Thu, 30 Oct 2025 15:45:00 +0000

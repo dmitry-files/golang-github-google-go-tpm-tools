@@ -3,7 +3,7 @@ Section: golang
 Priority: optional
 Maintainer: Debian Go Packaging Team <team+pkg-go@tracker.debian.org>
 Uploaders:
- Simon Josefsson <simon@josefsson.org>,
+ Dmitry <debian@dmitry.ms>,
 Rules-Requires-Root: no
 Build-Depends:
  debhelper-compat (= 13),
