@@ -12,10 +12,11 @@ import (
 	tgtestdata "github.com/google/go-tdx-guest/testing/testdata"
 	"github.com/google/go-tpm-tools/client"
 	"github.com/google/go-tpm-tools/internal/test"
-	"github.com/google/go-tpm-tools/internal/util"
 	pb "github.com/google/go-tpm-tools/proto/attest"
+	"github.com/google/go-tpm-tools/verifier/util"
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestVerifyNoncePass(t *testing.T) {
@@ -146,6 +147,18 @@ func TestHwAttestationPass(t *testing.T) {
 				if err := RootCmd.Execute(); err != nil {
 					t.Error(err)
 				}
+				msBytes, err := os.ReadFile(outputFile)
+				if err != nil {
+					t.Fatalf("failed to read file: %v", err)
+				}
+				ms := &pb.MachineState{}
+				err = proto.Unmarshal(msBytes, ms)
+				if err != nil {
+					t.Fatalf("failed to unmarshal proto: %v", err)
+				}
+				if ms.TeeAttestation == nil {
+					t.Error("found nil TEE attestation, expected a set TEEattestation")
+				}
 			}
 		})
 	}
@@ -176,6 +189,7 @@ func TestTdxAttestation(t *testing.T) {
 	}{
 		{"Correct TEE Nonce", teeNonce, ""},
 		{"Incorrect TEE Nonce", wrongTeeNonce, "quote field REPORT_DATA"},
+		{"Incorrect Nonce Using TPM Nonce", wrongTeeNonce, "quote field REPORT_DATA"},
 	}
 
 	for _, op := range tests {

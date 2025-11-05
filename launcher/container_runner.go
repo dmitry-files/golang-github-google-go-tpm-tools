@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -24,16 +23,21 @@ import (
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/remotes"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/go-tpm-tools/cel"
 	"github.com/google/go-tpm-tools/client"
-	"github.com/google/go-tpm-tools/internal/util"
 	"github.com/google/go-tpm-tools/launcher/agent"
+	"github.com/google/go-tpm-tools/launcher/internal/healthmonitoring/nodeproblemdetector"
+	"github.com/google/go-tpm-tools/launcher/internal/logging"
 	"github.com/google/go-tpm-tools/launcher/internal/signaturediscovery"
-	"github.com/google/go-tpm-tools/launcher/internal/systemctl"
 	"github.com/google/go-tpm-tools/launcher/launcherfile"
+	"github.com/google/go-tpm-tools/launcher/registryauth"
 	"github.com/google/go-tpm-tools/launcher/spec"
 	"github.com/google/go-tpm-tools/launcher/teeserver"
+	"github.com/google/go-tpm-tools/verifier"
+	"github.com/google/go-tpm-tools/verifier/ita"
+	"github.com/google/go-tpm-tools/verifier/util"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/oauth2"
@@ -44,7 +48,7 @@ type ContainerRunner struct {
 	container     containerd.Container
 	launchSpec    spec.LaunchSpec
 	attestAgent   agent.AttestationAgent
-	logger        *log.Logger
+	logger        logging.Logger
 	serialConsole *os.File
 }
 
@@ -73,15 +77,29 @@ const (
 	defaultRefreshJitter = 0.1
 )
 
+// Default OOM score for a CS container.
+const defaultOOMScore = 1000
+
 // NewRunner returns a runner.
-func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.Token, launchSpec spec.LaunchSpec, mdsClient *metadata.Client, tpm io.ReadWriteCloser, logger *log.Logger, serialConsole *os.File) (*ContainerRunner, error) {
+func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.Token, launchSpec spec.LaunchSpec, mdsClient *metadata.Client, tpm io.ReadWriteCloser, logger logging.Logger, serialConsole *os.File) (*ContainerRunner, error) {
 	image, err := initImage(ctx, cdClient, launchSpec, token)
 	if err != nil {
 		return nil, err
 	}
 
-	mounts := make([]specs.Mount, 0)
+	var mounts []specs.Mount
+	for _, lsMnt := range launchSpec.Mounts {
+		mounts = append(mounts, lsMnt.SpecsMount())
+	}
 	mounts = appendTokenMounts(mounts)
+	var cgroupOpts []oci.SpecOpts
+	if launchSpec.CgroupNamespace {
+		mounts = appendCgroupRw(mounts)
+		cgroupOpts = []oci.SpecOpts{
+			oci.WithNamespacedCgroup(),
+			oci.WithLinuxNamespace(specs.LinuxNamespace{Type: specs.CgroupNamespace}),
+		}
+	}
 
 	envs, err := formatEnvVars(launchSpec.Envs)
 	if err != nil {
@@ -94,37 +112,52 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 		container.Delete(ctx, containerd.WithSnapshotCleanup)
 	}
 
-	logger.Printf("Operator Input Image Ref   : %v\n", image.Name())
-	logger.Printf("Image Digest               : %v\n", image.Target().Digest)
-	logger.Printf("Operator Override Env Vars : %v\n", envs)
-	logger.Printf("Operator Override Cmd      : %v\n", launchSpec.Cmd)
+	logger.Info("Preparing Container Runner",
+		"operator_input_image_ref", image.Name(),
+		"image_digest", image.Target().Digest,
+		"operator_override_env_vars", envs,
+		"operator_override_cmd", launchSpec.Cmd,
+	)
 
 	imageConfig, err := getImageConfig(ctx, image)
 	if err != nil {
 		return nil, err
 	}
 
-	logger.Printf("Exposed Ports:             : %v\n", imageConfig.ExposedPorts)
+	logger.Info(fmt.Sprintf("Exposed Ports:             : %v\n", imageConfig.ExposedPorts))
 	if err := openPorts(imageConfig.ExposedPorts); err != nil {
 		return nil, err
 	}
 
-	logger.Printf("Image Labels               : %v\n", imageConfig.Labels)
-	launchPolicy, err := spec.GetLaunchPolicy(imageConfig.Labels)
+	logger.Info(fmt.Sprintf("Image Labels               : %v\n", imageConfig.Labels))
+	launchPolicy, err := spec.GetLaunchPolicy(imageConfig.Labels, logger)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse image Launch Policy: %v: contact the image author", err)
 	}
 	if err := launchPolicy.Verify(launchSpec); err != nil {
 		return nil, err
 	}
 
-	logger.Printf("Launch Policy              : %+v\n", launchPolicy)
+	if launchSpec.MonitoringEnabled == spec.All && !launchSpec.Experiments.EnableHealthMonitoring {
+		logger.Info("Health Monitoring experiment is not enabled - falling back to memory-only.")
+		if err := enableMonitoring(spec.MemoryOnly, logger); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := enableMonitoring(launchSpec.MonitoringEnabled, logger); err != nil {
+			return nil, err
+		}
+	}
+
+	logger.Info(fmt.Sprintf("Launch Policy              : %+v\n", launchPolicy))
 
 	if imageConfigDescriptor, err := image.Config(ctx); err != nil {
-		logger.Println(err)
+		logger.Error(err.Error())
 	} else {
-		logger.Printf("Image ID                   : %v\n", imageConfigDescriptor.Digest)
-		logger.Printf("Image Annotations          : %v\n", imageConfigDescriptor.Annotations)
+		logger.Info("Retrieved image config",
+			"image_id", imageConfigDescriptor.Digest,
+			"image_annotations", imageConfigDescriptor.Annotations,
+		)
 	}
 
 	hostname, err := os.Hostname()
@@ -138,23 +171,31 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 		Soft: nofile,
 	}}
 
+	specOpts := []oci.SpecOpts{
+		oci.WithImageConfigArgs(image, launchSpec.Cmd),
+		oci.WithEnv(envs),
+		oci.WithMounts(mounts),
+		// following 4 options are here to allow the container to have
+		// the host network (same effect as --net-host in ctr command)
+		oci.WithHostHostsFile,
+		oci.WithHostResolvconf,
+		oci.WithHostNamespace(specs.NetworkNamespace),
+		oci.WithEnv([]string{fmt.Sprintf("HOSTNAME=%s", hostname)}),
+		oci.WithAddedCapabilities(launchSpec.AddedCapabilities),
+		withRlimits(rlimits),
+		withOOMScoreAdj(defaultOOMScore),
+	}
+	if launchSpec.DevShmSize != 0 {
+		specOpts = append(specOpts, oci.WithDevShmSize(launchSpec.DevShmSize))
+	}
+	specOpts = append(specOpts, cgroupOpts...)
+
 	container, err = cdClient.NewContainer(
 		ctx,
 		containerID,
 		containerd.WithImage(image),
 		containerd.WithNewSnapshot(snapshotID, image),
-		containerd.WithNewSpec(
-			oci.WithImageConfigArgs(image, launchSpec.Cmd),
-			oci.WithEnv(envs),
-			oci.WithMounts(mounts),
-			// following 4 options are here to allow the container to have
-			// the host network (same effect as --net-host in ctr command)
-			oci.WithHostHostsFile,
-			oci.WithHostResolvconf,
-			oci.WithHostNamespace(specs.NetworkNamespace),
-			oci.WithEnv([]string{fmt.Sprintf("HOSTNAME=%s", hostname)}),
-			withRlimits(rlimits),
-		),
+		containerd.WithNewSpec(specOpts...),
 	)
 	if err != nil {
 		if container != nil {
@@ -167,6 +208,7 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 	if err != nil {
 		return nil, &RetryableError{err}
 	}
+
 	// Container process Args length should be strictly longer than the Cmd
 	// override length set by the operator, as we want the Entrypoint filed
 	// to be mandatory for the image.
@@ -197,28 +239,74 @@ func NewRunner(ctx context.Context, cdClient *containerd.Client, token oauth2.To
 
 	asAddr := launchSpec.AttestationServiceAddr
 
-	verifierClient, err := util.NewRESTClient(ctx, asAddr, launchSpec.ProjectID, launchSpec.Region)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create REST verifier client: %v", err)
+	var verifierClient verifier.Client
+	if launchSpec.ITARegion == "" {
+		gcaClient, err := util.NewRESTClient(ctx, asAddr, launchSpec.ProjectID, launchSpec.Region)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create REST verifier client: %v", err)
+		}
+
+		verifierClient = gcaClient
 	}
 
 	// Create a new signaturediscovery client to fetch signatures.
-	sdClient := getSignatureDiscoveryClient(cdClient, token, image.Target())
+	sdClient := getSignatureDiscoveryClient(cdClient, mdsClient, image.Target())
+
+	attestAgent, err := agent.CreateAttestationAgent(tpm, client.GceAttestationKeyECC, verifierClient, principalFetcherWithImpersonate, sdClient, launchSpec, logger)
+	if err != nil {
+		return nil, err
+	}
 	return &ContainerRunner{
 		container,
 		launchSpec,
-		agent.CreateAttestationAgent(tpm, client.GceAttestationKeyECC, verifierClient, principalFetcherWithImpersonate, sdClient, launchSpec, logger),
+		attestAgent,
 		logger,
 		serialConsole,
 	}, nil
 }
 
-func getSignatureDiscoveryClient(cdClient *containerd.Client, token oauth2.Token, imageDesc v1.Descriptor) signaturediscovery.Fetcher {
-	var remoteOpt containerd.RemoteOpt
-	if token.Valid() {
-		remoteOpt = containerd.WithResolver(Resolver(token.AccessToken))
+func enableMonitoring(enabled spec.MonitoringType, logger logging.Logger) error {
+	if enabled != spec.None {
+		logger.Info("Health Monitoring is enabled by the VM operator")
+
+		if enabled == spec.All {
+			logger.Info("All health monitoring metrics enabled")
+			if err := nodeproblemdetector.EnableAllConfig(); err != nil {
+				logger.Error("Failed to enable full monitoring config: %v", err)
+				return err
+			}
+		} else if enabled == spec.MemoryOnly {
+			logger.Info("memory/bytes_used enabled")
+		}
+
+		if err := nodeproblemdetector.StartService(logger); err != nil {
+			logger.Error(err.Error())
+			return err
+		}
+	} else {
+		logger.Info("Health Monitoring is disabled")
 	}
-	return signaturediscovery.New(cdClient, imageDesc, remoteOpt)
+
+	return nil
+}
+
+func getSignatureDiscoveryClient(cdClient *containerd.Client, mdsClient *metadata.Client, imageDesc v1.Descriptor) signaturediscovery.Fetcher {
+	resolverFetcher := func(ctx context.Context) (remotes.Resolver, error) {
+		return registryauth.RefreshResolver(ctx, mdsClient)
+	}
+	imageFetcher := func(ctx context.Context, imageRef string, opts ...containerd.RemoteOpt) (containerd.Image, error) {
+		image, err := pullImageWithRetries(
+			func() (containerd.Image, error) {
+				return cdClient.Pull(ctx, imageRef, opts...)
+			},
+			pullImageBackoffPolicy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("cannot pull signature objects from the signature image [%s]: %w", imageRef, err)
+		}
+		return image, nil
+	}
+	return signaturediscovery.New(imageDesc, resolverFetcher, imageFetcher)
 }
 
 // formatEnvVars formats the environment variables to the oci format
@@ -249,10 +337,8 @@ func (r *ContainerRunner) measureCELEvents(ctx context.Context) error {
 	if err := r.measureContainerClaims(ctx); err != nil {
 		return fmt.Errorf("failed to measure container claims: %v", err)
 	}
-	if r.launchSpec.Experiments.EnableMeasureMemoryMonitor {
-		if err := r.measureMemoryMonitor(); err != nil {
-			return fmt.Errorf("failed to measure memory monitoring state: %v", err)
-		}
+	if err := r.measureMemoryMonitor(); err != nil {
+		return fmt.Errorf("failed to measure memory monitoring state: %v", err)
 	}
 
 	separator := cel.CosTlv{
@@ -322,13 +408,13 @@ func (r *ContainerRunner) measureContainerClaims(ctx context.Context) error {
 // eventlog in the AttestationAgent.
 func (r *ContainerRunner) measureMemoryMonitor() error {
 	var enabled uint8
-	if r.launchSpec.MemoryMonitoringEnabled {
+	if r.launchSpec.MonitoringEnabled == spec.MemoryOnly {
 		enabled = 1
 	}
 	if err := r.attestAgent.MeasureEvent(cel.CosTlv{EventType: cel.MemoryMonitorType, EventContent: []byte{enabled}}); err != nil {
 		return err
 	}
-	r.logger.Println("Successfully measured memory monitoring event")
+	r.logger.Info("Successfully measured memory monitoring event")
 	return nil
 }
 
@@ -336,10 +422,10 @@ func (r *ContainerRunner) measureMemoryMonitor() error {
 // to wait before attemping to refresh it.
 // The token file will be written to a tmp file and then renamed.
 func (r *ContainerRunner) refreshToken(ctx context.Context) (time.Duration, error) {
-	r.logger.Print("refreshing attestation verifier OIDC token")
 	if err := r.attestAgent.Refresh(ctx); err != nil {
 		return 0, fmt.Errorf("failed to refresh attestation agent: %v", err)
 	}
+
 	// request a default token
 	token, err := r.attestAgent.Attest(ctx, agent.AttestAgentOpts{})
 	if err != nil {
@@ -375,25 +461,22 @@ func (r *ContainerRunner) refreshToken(ctx context.Context) (time.Duration, erro
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse token: %w", err)
 	}
-	claimsString, err := json.MarshalIndent(mapClaims, "", "  ")
-	if err != nil {
-		return 0, fmt.Errorf("failed to format claims: %w", err)
-	}
-	r.logger.Println(string(claimsString))
+
+	r.logger.Info("successfully refreshed attestation token", "token", mapClaims)
 
 	return getNextRefreshFromExpiration(time.Until(claims.ExpiresAt.Time), rand.Float64()), nil
 }
 
 // ctx must be a cancellable context.
 func (r *ContainerRunner) fetchAndWriteToken(ctx context.Context) error {
-	return r.fetchAndWriteTokenWithRetry(ctx, defaultRetryPolicy())
+	return r.fetchAndWriteTokenWithRetry(ctx, defaultRetryPolicy)
 }
 
 // ctx must be a cancellable context.
 // retry specifies the refresher goroutine's retry policy.
 func (r *ContainerRunner) fetchAndWriteTokenWithRetry(ctx context.Context,
-	retry *backoff.ExponentialBackOff) error {
-	if err := os.MkdirAll(launcherfile.HostTmpPath, 0744); err != nil {
+	retry func() *backoff.ExponentialBackOff) error {
+	if err := os.MkdirAll(launcherfile.HostTmpPath, 0755); err != nil {
 		return err
 	}
 	duration, err := r.refreshToken(ctx)
@@ -408,9 +491,10 @@ func (r *ContainerRunner) fetchAndWriteTokenWithRetry(ctx context.Context,
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				r.logger.Println("token refreshing stopped")
+				r.logger.Info("token refreshing stopped")
 				return
 			case <-timer.C:
+				r.logger.Info("refreshing attestation verifier OIDC token")
 				var duration time.Duration
 				// Refresh token with default retry policy.
 				err := backoff.RetryNotify(
@@ -418,12 +502,12 @@ func (r *ContainerRunner) fetchAndWriteTokenWithRetry(ctx context.Context,
 						duration, err = r.refreshToken(ctx)
 						return err
 					},
-					retry,
+					retry(),
 					func(err error, t time.Duration) {
-						r.logger.Printf("failed to refresh attestation service token at time %v: %v", t, err)
+						r.logger.Error(fmt.Sprintf("failed to refresh attestation service token at time %v: %v", t, err))
 					})
 				if err != nil {
-					r.logger.Printf("failed all attempts to refresh attestation service token, stopping refresher: %v", err)
+					r.logger.Error(fmt.Sprintf("failed all attempts to refresh attestation service token, stopping refresher: %v", err))
 					return
 				}
 
@@ -479,9 +563,17 @@ func defaultRetryPolicy() *backoff.ExponentialBackOff {
 	return expBack
 }
 
+func pullImageBackoffPolicy() backoff.BackOff {
+	b := backoff.NewConstantBackOff(time.Millisecond * 500)
+	return backoff.WithMaxRetries(b, 3)
+}
+
 // Run the container
 // Container output will always be redirected to logger writer for now
 func (r *ContainerRunner) Run(ctx context.Context) error {
+	// Note start time for workload setup.
+	start := time.Now()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -489,57 +581,60 @@ func (r *ContainerRunner) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to measure CEL events: %v", err)
 	}
 
-	if err := r.fetchAndWriteToken(ctx); err != nil {
-		return fmt.Errorf("failed to fetch and write OIDC token: %v", err)
+	// Only refresh token if agent has a default GCA client (not ITA use case).
+	if r.launchSpec.ITARegion == "" {
+		if err := r.fetchAndWriteToken(ctx); err != nil {
+			return fmt.Errorf("failed to fetch and write OIDC token: %v", err)
+		}
 	}
 
-	r.logger.Printf("EnableTestFeatureForImage is set to %v\n", r.launchSpec.Experiments.EnableTestFeatureForImage)
-	// create and start the TEE server behind the experiment
-	if r.launchSpec.Experiments.EnableOnDemandAttestation {
-		r.logger.Println("EnableOnDemandAttestation is enabled: initializing TEE server.")
-		teeServer, err := teeserver.New(ctx, path.Join(launcherfile.HostTmpPath, teeServerSocket), r.attestAgent, r.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create the TEE server: %v", err)
-		}
-		go teeServer.Serve()
-		defer teeServer.Shutdown(ctx)
-	}
+	// create and start the TEE server
+	r.logger.Info("EnableOnDemandAttestation is enabled: initializing TEE server.")
 
-	// start node-problem-detector.service to collect memory related metrics.
-	if r.launchSpec.MemoryMonitoringEnabled {
-		r.logger.Println("MemoryMonitoring is enabled by the VM operator")
-		s, err := systemctl.New()
+	attestClients := &teeserver.AttestClients{}
+	if r.launchSpec.ITARegion != "" {
+		itaClient, err := ita.NewClient(r.launchSpec.ITARegion, r.launchSpec.ITAKey)
 		if err != nil {
-			return fmt.Errorf("failed to create systemctl client: %v", err)
+			return fmt.Errorf("failed to create ITA client: %v", err)
 		}
-		defer s.Close()
 
-		r.logger.Println("Starting a systemctl operation: systemctl start node-problem-detector.service")
-		if err := s.Start("node-problem-detector.service"); err != nil {
-			return fmt.Errorf("failed to start node-problem-detector.service: %v", err)
-		}
-		r.logger.Println("node-problem-detector.service successfully started.")
+		attestClients.ITA = itaClient
 	} else {
-		r.logger.Println("MemoryMonitoring is disabled by the VM operator")
+		gcaClient, err := util.NewRESTClient(ctx, r.launchSpec.AttestationServiceAddr, r.launchSpec.ProjectID, r.launchSpec.Region)
+		if err != nil {
+			return fmt.Errorf("failed to create REST verifier client: %v", err)
+		}
+
+		attestClients.GCA = gcaClient
+	}
+
+	teeServer, err := teeserver.New(ctx, path.Join(launcherfile.HostTmpPath, teeServerSocket), r.attestAgent, r.logger, r.launchSpec, attestClients)
+	if err != nil {
+		return fmt.Errorf("failed to create the TEE server: %v", err)
+	}
+	go teeServer.Serve()
+	defer teeServer.Shutdown(ctx)
+
+	// Avoids breaking existing memory monitoring tests that depend on this log.
+	if r.launchSpec.MonitoringEnabled == spec.None {
+		r.logger.Info("MemoryMonitoring is disabled by the VM operator")
 	}
 
 	var streamOpt cio.Opt
 	switch r.launchSpec.LogRedirect {
 	case spec.Nowhere:
 		streamOpt = cio.WithStreams(nil, nil, nil)
-		r.logger.Println("Container stdout/stderr will not be redirected.")
+		r.logger.Info("Container stdout/stderr will not be redirected.")
 	case spec.Everywhere:
 		w := io.MultiWriter(os.Stdout, r.serialConsole)
 		streamOpt = cio.WithStreams(nil, w, w)
-		r.logger.Println("Container stdout/stderr will be redirected to serial and Cloud Logging. " +
-			"This may result in performance issues due to slow serial console writes.")
+		r.logger.Info("Container stdout/stderr will be redirected to serial and Cloud Logging. This may result in performance issues due to slow serial console writes.")
 	case spec.CloudLogging:
 		streamOpt = cio.WithStreams(nil, os.Stdout, os.Stdout)
-		r.logger.Println("Container stdout/stderr will be redirected to Cloud Logging.")
+		r.logger.Info("Container stdout/stderr will be redirected to Cloud Logging.")
 	case spec.Serial:
 		streamOpt = cio.WithStreams(nil, r.serialConsole, r.serialConsole)
-		r.logger.Println("Container stdout/stderr will be redirected to serial logging. " +
-			"This may result in performance issues due to slow serial console writes.")
+		r.logger.Info("Container stdout/stderr will be redirected to serial logging. This may result in performance issues due to slow serial console writes.")
 	default:
 		return fmt.Errorf("unknown logging redirect location: %v", r.launchSpec.LogRedirect)
 	}
@@ -550,16 +645,24 @@ func (r *ContainerRunner) Run(ctx context.Context) error {
 	}
 	defer task.Delete(ctx)
 
+	setupDuration := time.Since(start)
+	r.logger.Info("Workload setup completed",
+		"setup_sec", setupDuration.Seconds(),
+	)
+
 	exitStatusC, err := task.Wait(ctx)
 	if err != nil {
-		r.logger.Println(err)
+		r.logger.Error(err.Error())
 	}
-	r.logger.Println("workload task started")
+	// Start timer for workload execution.
+	start = time.Now()
+	r.logger.Info("workload task started")
 
 	if err := task.Start(ctx); err != nil {
 		return &RetryableError{err}
 	}
 	status := <-exitStatusC
+	workloadDuration := time.Since(start)
 
 	code, _, err := status.Result()
 	if err != nil {
@@ -567,24 +670,50 @@ func (r *ContainerRunner) Run(ctx context.Context) error {
 	}
 
 	if code != 0 {
-		r.logger.Println("workload task ended and returned non-zero")
+		r.logger.Error("workload task ended and returned non-zero",
+			"workload_execution_sec", workloadDuration.Seconds(),
+		)
 		return &WorkloadError{code}
 	}
-	r.logger.Println("workload task ended and returned 0")
+	r.logger.Info("workload task ended and returned 0",
+		"workload_execution_sec", workloadDuration.Seconds(),
+	)
 	return nil
+}
+
+func pullImageWithRetries(f func() (containerd.Image, error), retry func() backoff.BackOff) (containerd.Image, error) {
+	var err error
+	var image containerd.Image
+	err = backoff.Retry(func() error {
+		image, err = f()
+		return err
+	}, retry())
+	if err != nil {
+		return nil, fmt.Errorf("failed to pull image with retries, the last error is: %w", err)
+	}
+	return image, nil
 }
 
 func initImage(ctx context.Context, cdClient *containerd.Client, launchSpec spec.LaunchSpec, token oauth2.Token) (containerd.Image, error) {
 	if token.Valid() {
-		remoteOpt := containerd.WithResolver(Resolver(token.AccessToken))
-
-		image, err := cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack, remoteOpt)
+		remoteOpt := containerd.WithResolver(registryauth.Resolver(token.AccessToken))
+		image, err := pullImageWithRetries(
+			func() (containerd.Image, error) {
+				return cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack, remoteOpt)
+			},
+			pullImageBackoffPolicy,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("cannot pull the image: %w", err)
 		}
 		return image, nil
 	}
-	image, err := cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack)
+	image, err := pullImageWithRetries(
+		func() (containerd.Image, error) {
+			return cdClient.Pull(ctx, launchSpec.ImageRef, containerd.WithPullUnpack)
+		},
+		pullImageBackoffPolicy,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("cannot pull the image (no token, only works for a public image): %w", err)
 	}
@@ -610,11 +739,17 @@ func openPorts(ports map[string]struct{}) error {
 			return fmt.Errorf("received unknown protocol: got %s, expected tcp or udp", protocol)
 		}
 
-		// This command will write a firewall rule to accept all INPUT packets for the given port/protocol.
+		// These 2 commands will write firewall rules to accept all INPUT packets for the given port/protocol
+		// for IPv4 and IPv6 traffic.
 		cmd := exec.Command("iptables", "-A", "INPUT", "-p", protocol, "--dport", port, "-j", "ACCEPT")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("failed to open port %s %s: %v %s", port, protocol, err, out)
+			return fmt.Errorf("failed to open port on IPv4 %s %s: %v %s", port, protocol, err, out)
+		}
+		v6cmd := exec.Command("ip6tables", "-A", "INPUT", "-p", protocol, "--dport", port, "-j", "ACCEPT")
+		out, err = v6cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to open port on IPv6 %s %s: %v %s", port, protocol, err, out)
 		}
 	}
 
@@ -643,6 +778,9 @@ func getImageConfig(ctx context.Context, image containerd.Image) (v1.ImageConfig
 
 // Close the container runner
 func (r *ContainerRunner) Close(ctx context.Context) {
+	// close the agent
+	r.attestAgent.Close()
+
 	// Exit gracefully:
 	// Delete container and close connection to attestation service.
 	r.container.Delete(ctx, containerd.WithSnapshotCleanup)
@@ -654,4 +792,24 @@ func withRlimits(rlimits []specs.POSIXRlimit) oci.SpecOpts {
 		s.Process.Rlimits = rlimits
 		return nil
 	}
+}
+
+// Set the container process's OOM score.
+func withOOMScoreAdj(oomScore int) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		s.Process.OOMScoreAdj = &oomScore
+		return nil
+	}
+}
+
+// appendCgroupRw mount maps a cgroup as read-write.
+func appendCgroupRw(mounts []specs.Mount) []specs.Mount {
+	m := specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+		Source:      "cgroup",
+		Options:     []string{"rw", "nosuid", "noexec", "nodev"},
+	}
+
+	return append(mounts, m)
 }

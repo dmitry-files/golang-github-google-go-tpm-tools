@@ -11,6 +11,5 @@ files/go-tpm-tools
 .vscode*
 *.code-workspace
 main
-
-/.pc/
-/_build/
+go.work
+go.work.sum

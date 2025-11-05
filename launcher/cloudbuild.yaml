@@ -1,8 +1,7 @@
 substitutions:
-  # using this base image for now, because there is an issue causing the newest COS dev
-  # image not booting with cs.
-  '_BASE_IMAGE': '' # left empty means using the latest image in the family
-  '_BASE_IMAGE_FAMILY': 'cos-dev' # base image family
+  '_BASE_IMAGE': '' # If left empty, will use the latest image in _BASE_IMAGE_FAMILY of _BASE_IMAGE_PROJECT
+  '_BASE_IMAGE_FAMILY': 'cos-tdx-113-lts'
+  '_BASE_IMAGE_PROJECT': 'confidential-vm-images'
   '_OUTPUT_IMAGE_PREFIX': 'confidential-space'
   '_OUTPUT_IMAGE_SUFFIX': ''
   '_OUTPUT_IMAGE_FAMILY': ''
@@ -15,61 +14,83 @@ steps:
   env:
   - 'BASE_IMAGE=$_BASE_IMAGE'
   - 'BASE_IMAGE_FAMILY=$_BASE_IMAGE_FAMILY'
+  - 'BASE_IMAGE_PROJECT=$_BASE_IMAGE_PROJECT'
   script: |
     #!/usr/bin/env bash
 
-    # if BASE_IMAGE is not specified in the substitutions, use the latest COS dev image
+    # if BASE_IMAGE is not specified in the substitutions, use the latest image of the image family
     base_image=${BASE_IMAGE}
     if [ -z ${base_image} ]
     then
-      echo "getting the latest COS image"
-      base_image=$(gcloud compute images describe-from-family ${BASE_IMAGE_FAMILY} --project cos-cloud | grep name | cut -d ' ' -f 2)
+      echo "getting the latest image from project:" ${BASE_IMAGE_PROJECT} "family: "${BASE_IMAGE_FAMILY}
+      base_image=$(gcloud compute images describe-from-family ${BASE_IMAGE_FAMILY} --project ${BASE_IMAGE_PROJECT} | grep name | cut -d ' ' -f 2)
     fi
 
+    echo "base image:" ${base_image} "project:" ${BASE_IMAGE_PROJECT} 
     echo ${base_image} > /workspace/base_image.txt
 
 - name: 'gcr.io/cloud-builders/gcloud'
   id: DebugImageBuild
   waitFor: ['BaseImageIdent']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
-  - 'OUTPUT_IMAGE_FAMILY=$_OUTPUT_IMAGE_FAMILY'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
+  - 'OUTPUT_IMAGE_FAMILY=${_OUTPUT_IMAGE_FAMILY}'
   - 'BUCKET_NAME=$_BUCKET_NAME'
+  - 'SHORT_SHA=${SHORT_SHA}'
+  - 'BASE_IMAGE_PROJECT=$_BASE_IMAGE_PROJECT'
   script: |
     #!/usr/bin/env bash
     set -exuo pipefail
 
     base_image=$(cat /workspace/base_image.txt)
     echo "building the debug image: ${OUTPUT_IMAGE_PREFIX}-debug-${OUTPUT_IMAGE_SUFFIX} with the base image: ${base_image}"
-    gcloud builds submit --config=launcher/image/cloudbuild.yaml --region us-west1 \
-      --substitutions _BASE_IMAGE=${base_image},_OUTPUT_IMAGE_FAMILY=${OUTPUT_IMAGE_FAMILY}-debug,_OUTPUT_IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-debug-${OUTPUT_IMAGE_SUFFIX},_IMAGE_ENV=debug,_CS_LICENSE=projects/confidential-space-images/global/licenses/confidential-space-debug,_BUCKET_NAME=${BUCKET_NAME}
+    gcloud builds submit --config=launcher/image/cloudbuild.yaml \
+    --region us-west1 \
+    --substitutions _SHORT_SHA=${SHORT_SHA},\
+    _BASE_IMAGE=${base_image},\
+    _BASE_IMAGE_PROJECT=${BASE_IMAGE_PROJECT},\
+    _OUTPUT_IMAGE_FAMILY=${OUTPUT_IMAGE_FAMILY}-debug,\
+    _OUTPUT_IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-debug-${OUTPUT_IMAGE_SUFFIX},\
+    _IMAGE_ENV=debug,\
+    _CS_LICENSE=projects/confidential-space-images/global/licenses/confidential-space-debug,\
+    _BUCKET_NAME=${BUCKET_NAME}
     exit
 
 - name: 'gcr.io/cloud-builders/gcloud'
   id: HardenedImageBuild
   waitFor: ['BaseImageIdent']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
-  - 'OUTPUT_IMAGE_FAMILY=$_OUTPUT_IMAGE_FAMILY'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
+  - 'OUTPUT_IMAGE_FAMILY=${_OUTPUT_IMAGE_FAMILY}'
   - 'BUCKET_NAME=$_BUCKET_NAME'
+  - 'SHORT_SHA=${SHORT_SHA}'
+  - 'BASE_IMAGE_PROJECT=$_BASE_IMAGE_PROJECT'
   script: |
     #!/usr/bin/env bash
     set -exuo pipefail
 
     base_image=$(cat /workspace/base_image.txt)
     echo "building the hardened image: ${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX} with the base image: ${base_image}"
-    gcloud builds submit --config=launcher/image/cloudbuild.yaml --region us-west1 \
-      --substitutions _BASE_IMAGE=${base_image},_OUTPUT_IMAGE_FAMILY=${OUTPUT_IMAGE_FAMILY},_OUTPUT_IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_ENV=hardened,_CS_LICENSE=projects/confidential-space-images/global/licenses/confidential-space,_BUCKET_NAME=${BUCKET_NAME}
+    gcloud builds submit --config=launcher/image/cloudbuild.yaml \
+    --region us-west1 \
+    --substitutions _SHORT_SHA=${SHORT_SHA},\
+    _BASE_IMAGE=${base_image},\
+    _BASE_IMAGE_PROJECT=${BASE_IMAGE_PROJECT},\
+    _OUTPUT_IMAGE_FAMILY=${OUTPUT_IMAGE_FAMILY},\
+    _OUTPUT_IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},\
+    _IMAGE_ENV=hardened,\
+    _CS_LICENSE=projects/confidential-space-images/global/licenses/confidential-space,\
+    _BUCKET_NAME=${BUCKET_NAME}
     exit
 
 - name: 'gcr.io/cloud-builders/gcloud'
   id: ExperimentsTests
   waitFor: ['DebugImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -84,8 +105,8 @@ steps:
   id: HttpServerTests
   waitFor: ['DebugImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -100,8 +121,8 @@ steps:
   id: DebugImageTests
   waitFor: ['DebugImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -116,8 +137,8 @@ steps:
   id: HardenedImageTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -131,8 +152,8 @@ steps:
   id: LaunchPolicyTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -147,8 +168,8 @@ steps:
   id: HardenedNetworkIngressTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -161,8 +182,8 @@ steps:
   id: DebugNetworkIngressTests
   waitFor: ['DebugImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -175,8 +196,8 @@ steps:
   id: LogRedirectionTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -190,8 +211,8 @@ steps:
   id: HardenedDiscoverContainerSignatureTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -204,8 +225,8 @@ steps:
   id: DebugDiscoverContainerSignatureTests
   waitFor: ['DebugImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -218,8 +239,8 @@ steps:
   id: MemoryMonitoringTests
   waitFor: ['HardenedImageBuild']
   env:
-  - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
-  - 'OUTPUT_IMAGE_SUFFIX=$_OUTPUT_IMAGE_SUFFIX'
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
   - 'PROJECT_ID=$PROJECT_ID'
   script: |
     #!/usr/bin/env bash
@@ -229,7 +250,7 @@ steps:
       --substitutions _IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_PROJECT=${PROJECT_ID}
     exit
 - name: 'gcr.io/cloud-builders/gcloud'
-  id: ODAWithSignedContainerTest
+  id: HealthMonitoringTests
   waitFor: ['HardenedImageBuild']
   env:
   - 'OUTPUT_IMAGE_PREFIX=$_OUTPUT_IMAGE_PREFIX'
@@ -238,8 +259,52 @@ steps:
   script: |
     #!/usr/bin/env bash
     cd launcher/image/test
+    echo "running health monitoring tests on ${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX}"
+    gcloud builds submit --config=test_health_monitoring.yaml --region us-west1 \
+      --substitutions _IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_PROJECT=${PROJECT_ID}
+    exit
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: ODAWithSignedContainerTest
+  waitFor: ['HardenedImageBuild']
+  env:
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
+  - 'PROJECT_ID=$PROJECT_ID'
+  script: |
+    #!/usr/bin/env bash
+    cd launcher/image/test
     echo "running ODA and signed container tests on ${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX}"
     gcloud builds submit --config=test_oda_with_signed_container.yaml --region us-west1 \
+      --substitutions _IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_PROJECT=${PROJECT_ID}
+    exit
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: MountTests
+  waitFor: ['HardenedImageBuild']
+  env:
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
+  - 'PROJECT_ID=$PROJECT_ID'
+  script: |
+    #!/usr/bin/env bash
+    cd launcher/image/test
+    dev_shm_size_kb=$(shuf -i 70000-256000 -n 1)
+    tmpfs_size_kb=$(shuf -i 256-256000 -n 1)
+    echo "running mount tests on ${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX}"
+    gcloud builds submit --config=test_mounts.yaml --region us-west1 \
+      --substitutions _IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_PROJECT=${PROJECT_ID}
+    exit
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: PrivilegedTests
+  waitFor: ['HardenedImageBuild']
+  env:
+  - 'OUTPUT_IMAGE_PREFIX=${_OUTPUT_IMAGE_PREFIX}'
+  - 'OUTPUT_IMAGE_SUFFIX=${_OUTPUT_IMAGE_SUFFIX}'
+  - 'PROJECT_ID=$PROJECT_ID'
+  script: |
+    #!/usr/bin/env bash
+    cd launcher/image/test
+    echo "running privileged tests on ${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX}"
+    gcloud builds submit --config=test_privileged.yaml --region us-west1 \
       --substitutions _IMAGE_NAME=${OUTPUT_IMAGE_PREFIX}-hardened-${OUTPUT_IMAGE_SUFFIX},_IMAGE_PROJECT=${PROJECT_ID}
     exit
 options:

@@ -1,31 +1,21 @@
 package server
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/asn1"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"os"
-	"strings"
+	"strconv"
 	"testing"
-	"time"
 
-	"github.com/google/go-cmp/cmp"
-	sgclient "github.com/google/go-sev-guest/client"
-	sgtest "github.com/google/go-sev-guest/testing"
-	testclient "github.com/google/go-sev-guest/testing/client"
-	sv "github.com/google/go-sev-guest/verify"
-	tgtest "github.com/google/go-tdx-guest/testing"
-	tgtestclient "github.com/google/go-tdx-guest/testing/client"
-	tgtestdata "github.com/google/go-tdx-guest/testing/testdata"
-	tv "github.com/google/go-tdx-guest/verify"
-	"github.com/google/go-tpm-tools/cel"
 	"github.com/google/go-tpm-tools/client"
 	"github.com/google/go-tpm-tools/internal"
 	"github.com/google/go-tpm-tools/internal/test"
@@ -34,10 +24,7 @@ import (
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/google/logger"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/testing/protocmp"
 )
-
-var measuredHashes = []crypto.Hash{crypto.SHA1, crypto.SHA256}
 
 func getDigestHash(input string) []byte {
 	inputDigestHash := sha256.New()
@@ -208,142 +195,6 @@ func TestVerifyUsingDifferentPCR(t *testing.T) {
 	}
 }
 
-func TestVerifyBasicAttestationWithSevSnp(t *testing.T) {
-	rwc := test.GetTPM(t)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	// When running on hardware, ak.Attest will collect an attestation report regardless of
-	// AttestOpts. We test the default behavior here by not passing in a device.
-	sevTestDevice, goodSnpRoot, _, kdsGetter := testclient.GetSevGuest(nil, &sgtest.DeviceOptions{}, t)
-	defer sevTestDevice.Close()
-
-	nonce := []byte("super secret nonce")
-	attestation, err := ak.Attest(client.AttestOpts{
-		Nonce: nonce,
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-
-	teeopts := &VerifySnpOpts{
-		Validation: SevSnpDefaultValidateOpts(nonce),
-		Verification: &sv.Options{
-			Getter:       kdsGetter,
-			TrustedRoots: goodSnpRoot,
-		},
-	}
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      nonce,
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-	}); err != nil {
-		t.Errorf("failed to verify: %v", err)
-	}
-
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      append(nonce, 0),
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-		TEEOpts:    teeopts,
-	}); err == nil {
-		t.Error("using the wrong nonce should make verification fail")
-	}
-
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:   nonce,
-		TEEOpts: teeopts,
-	}); err == nil {
-		t.Error("using no trusted AKs should make verification fail")
-	}
-
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      nonce,
-		TrustedAKs: []crypto.PublicKey{priv.Public()},
-		TEEOpts:    teeopts,
-	}); err == nil {
-		t.Error("using a random trusted AKs should make verification fail")
-	}
-}
-
-func TestVerifyBasicAttestationWithTdx(t *testing.T) {
-
-	tdxEventLog := test.CreateTpm2EventLog(3) // Enum 3- TDX
-	rwc := test.GetSimulatorWithLog(t, tdxEventLog)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	tpmNonce := []byte("super secret nonce")
-	teeNonce := test.TdxReportData
-	var teeNonce64 [64]byte
-	copy(teeNonce64[:], teeNonce)
-	mockTdxQuoteProvider := tgtestclient.GetMockTdxQuoteProvider([]tgtest.TestCase{
-		{
-			Input: teeNonce64,
-			Quote: tgtestdata.RawQuote,
-		},
-	}, t)
-	attestation, err := ak.Attest(client.AttestOpts{
-		Nonce:     tpmNonce,
-		TEEDevice: &client.TdxQuoteProvider{QuoteProvider: mockTdxQuoteProvider},
-		TEENonce:  teeNonce64[:],
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-
-	teeopts := &VerifyTdxOpts{
-		Validation:   TdxDefaultValidateOpts(teeNonce),
-		Verification: tv.DefaultOptions(),
-	}
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      tpmNonce,
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-		TEEOpts:    teeopts,
-	}); err != nil {
-		t.Errorf("failed to verify: %v", err)
-	}
-
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      append(tpmNonce, 0),
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-		TEEOpts:    teeopts,
-	}); err == nil {
-		t.Error("using the wrong TPM nonce should make verification fail")
-	}
-
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:   tpmNonce,
-		TEEOpts: teeopts,
-	}); err == nil {
-		t.Error("using no trusted AKs should make verification fail")
-	}
-
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := VerifyAttestation(attestation, VerifyOpts{
-		Nonce:      tpmNonce,
-		TrustedAKs: []crypto.PublicKey{priv.Public()},
-		TEEOpts:    teeopts,
-	}); err == nil {
-		t.Error("using a random trusted AKs should make verification fail")
-	}
-}
-
 func TestVerifyWithTrustedAK(t *testing.T) {
 	rwc := test.GetTPM(t)
 	defer client.CheckedClose(t, rwc)
@@ -367,6 +218,47 @@ func TestVerifyWithTrustedAK(t *testing.T) {
 	_, err = VerifyAttestation(attestation, opts)
 	if err != nil {
 		t.Errorf("failed to verify: %v", err)
+	}
+}
+
+func TestVerifyHashNonce(t *testing.T) {
+	rwc := test.GetTPM(t)
+	defer client.CheckedClose(t, rwc)
+
+	ak, err := client.AttestationKeyRSA(rwc)
+	if err != nil {
+		t.Fatalf("failed to generate AK: %v", err)
+	}
+	defer ak.Close()
+	tests := []struct {
+		attHash bool
+		verHash bool
+		wantErr bool
+	}{
+		{true, true, false},
+		{false, false, false},
+		{true, false, true},
+		{false, true, true},
+	}
+	nonce := []byte("super secret nonce")
+
+	for _, test := range tests {
+		t.Run("attest hash "+strconv.FormatBool(test.attHash)+" verify hash "+strconv.FormatBool(test.verHash), func(t *testing.T) {
+			attestation, err := ak.Attest(client.AttestOpts{Nonce: nonce, HashNonce: test.attHash})
+			if err != nil {
+				t.Fatalf("failed to attest: %v", err)
+			}
+
+			opts := VerifyOpts{
+				Nonce:      nonce,
+				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
+				HashNonce:  test.verHash,
+			}
+			_, err = VerifyAttestation(attestation, opts)
+			if test.wantErr != (err != nil) {
+				t.Errorf("Attest(HashNonce %v), Verify(HashNonce %v): got %v wantErr %v", test.attHash, test.verHash, err, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -420,147 +312,6 @@ func TestVerifySHA1Attestation(t *testing.T) {
 	opts.AllowSHA1 = false
 	if _, err = VerifyAttestation(attestation, opts); err == nil {
 		t.Error("expected attestation to fail with only SHA-1")
-	}
-}
-
-func TestVerifyAttestationWithCEL(t *testing.T) {
-	test.SkipForRealTPM(t)
-	rwc := test.GetTPM(t)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	coscel := &cel.CEL{}
-	testEvents := []struct {
-		cosNestedEventType cel.CosType
-		pcr                int
-		eventPayload       []byte
-	}{
-		{cel.ImageRefType, cel.CosEventPCR, []byte("docker.io/bazel/experimental/test:latest")},
-		{cel.ImageDigestType, cel.CosEventPCR, []byte("sha256:781d8dfdd92118436bd914442c8339e653b83f6bf3c1a7a98efcfb7c4fed7483")},
-		{cel.RestartPolicyType, cel.CosEventPCR, []byte(attestpb.RestartPolicy_Never.String())},
-		{cel.ImageIDType, cel.CosEventPCR, []byte("sha256:5DF4A1AC347DCF8CF5E9D0ABC04B04DB847D1B88D3B1CC1006F0ACB68E5A1F4B")},
-		{cel.EnvVarType, cel.CosEventPCR, []byte("foo=bar")},
-		{cel.EnvVarType, cel.CosEventPCR, []byte("bar=baz")},
-		{cel.EnvVarType, cel.CosEventPCR, []byte("baz=foo=bar")},
-		{cel.EnvVarType, cel.CosEventPCR, []byte("empty=")},
-		{cel.ArgType, cel.CosEventPCR, []byte("--x")},
-		{cel.ArgType, cel.CosEventPCR, []byte("--y")},
-		{cel.OverrideArgType, cel.CosEventPCR, []byte("--x")},
-		{cel.OverrideEnvType, cel.CosEventPCR, []byte("empty=")},
-		{cel.MemoryMonitorType, cel.CosEventPCR, []byte{1}},
-	}
-	for _, testEvent := range testEvents {
-		cos := cel.CosTlv{EventType: testEvent.cosNestedEventType, EventContent: testEvent.eventPayload}
-		if err := coscel.AppendEvent(rwc, testEvent.pcr, measuredHashes, cos); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	var buf bytes.Buffer
-	if err := coscel.EncodeCEL(&buf); err != nil {
-		t.Fatal(err)
-	}
-
-	nonce := []byte("super secret nonce")
-	attestation, err := ak.Attest(client.AttestOpts{Nonce: nonce, CanonicalEventLog: buf.Bytes()})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-
-	opts := VerifyOpts{
-		Nonce:      nonce,
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-	}
-	state, err := VerifyAttestation(attestation, opts)
-	if err != nil {
-		t.Fatalf("failed to verify: %v", err)
-	}
-
-	expectedEnvVars := make(map[string]string)
-	expectedEnvVars["foo"] = "bar"
-	expectedEnvVars["bar"] = "baz"
-	expectedEnvVars["baz"] = "foo=bar"
-	expectedEnvVars["empty"] = ""
-
-	expectedOverriddenEnvVars := make(map[string]string)
-	expectedOverriddenEnvVars["empty"] = ""
-
-	wantContainerState := attestpb.ContainerState{
-		ImageReference:    string(testEvents[0].eventPayload),
-		ImageDigest:       string(testEvents[1].eventPayload),
-		RestartPolicy:     attestpb.RestartPolicy_Never,
-		ImageId:           string(testEvents[3].eventPayload),
-		EnvVars:           expectedEnvVars,
-		Args:              []string{string(testEvents[8].eventPayload), string(testEvents[9].eventPayload)},
-		OverriddenEnvVars: expectedOverriddenEnvVars,
-		OverriddenArgs:    []string{string(testEvents[10].eventPayload)},
-	}
-	enabled := true
-	wantHealthMonitoringState := attestpb.HealthMonitoringState{
-		MemoryEnabled: &enabled,
-	}
-	if diff := cmp.Diff(state.Cos.Container, &wantContainerState, protocmp.Transform()); diff != "" {
-		t.Errorf("unexpected container state difference:\n%v", diff)
-	}
-	if diff := cmp.Diff(state.Cos.HealthMonitoring, &wantHealthMonitoringState, protocmp.Transform()); diff != "" {
-		t.Errorf("unexpected health monitoring state difference:\n%v", diff)
-	}
-}
-
-func TestVerifyFailWithTamperedCELContent(t *testing.T) {
-	test.SkipForRealTPM(t)
-	rwc := test.GetTPM(t)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	c := &cel.CEL{}
-
-	cosEvent := cel.CosTlv{EventType: cel.ImageRefType, EventContent: []byte("docker.io/bazel/experimental/test:latest")}
-	cosEvent2 := cel.CosTlv{EventType: cel.ImageDigestType, EventContent: []byte("sha256:781d8dfdd92118436bd914442c8339e653b83f6bf3c1a7a98efcfb7c4fed7483")}
-	if err := c.AppendEvent(rwc, cel.CosEventPCR, measuredHashes, cosEvent); err != nil {
-		t.Fatalf("failed to append event: %v", err)
-	}
-	if err := c.AppendEvent(rwc, cel.CosEventPCR, measuredHashes, cosEvent2); err != nil {
-		t.Fatalf("failed to append event: %v", err)
-	}
-
-	// modify the first record content, but not the record digest
-	modifiedRecord := cel.CosTlv{EventType: cel.ImageDigestType, EventContent: []byte("sha256:000000000000000000000000000000000000000000000000000000000000000")}
-	modifiedTLV, err := modifiedRecord.GetTLV()
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Records[0].Content = modifiedTLV
-
-	var buf bytes.Buffer
-	if err := c.EncodeCEL(&buf); err != nil {
-		t.Fatal(err)
-	}
-
-	nonce := []byte("super secret nonce")
-	attestation, err := ak.Attest(client.AttestOpts{Nonce: nonce, CanonicalEventLog: buf.Bytes()})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-
-	opts := VerifyOpts{
-		Nonce:      nonce,
-		TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-	}
-	if _, err := VerifyAttestation(attestation, opts); err == nil {
-		t.Fatalf("VerifyAttestation should fail due to modified content")
-	} else if !strings.Contains(err.Error(), "CEL record content digest verification failed") {
-		t.Fatalf("expect to get digest verification failed error, but got %v", err)
 	}
 }
 
@@ -633,12 +384,7 @@ func TestVerifySucceedsWithOverlappingIntermediatesInOptionsAndAttestation(t *te
 	}
 }
 
-func TestVerifyFailWithCertsAndPubkey(t *testing.T) {
-	att := &attestpb.Attestation{}
-	if err := proto.Unmarshal(test.COS85NoNonce, att); err != nil {
-		t.Fatalf("failed to unmarshal attestation: %v", err)
-	}
-
+func TestValidateOptsFailWithCertsAndPubkey(t *testing.T) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -649,56 +395,99 @@ func TestVerifyFailWithCertsAndPubkey(t *testing.T) {
 		IntermediateCerts: GceEKIntermediates,
 		TrustedAKs:        []crypto.PublicKey{priv.Public()},
 	}
-	if _, err := VerifyAttestation(att, opts); err == nil {
+	if err := validateOpts(opts); err == nil {
 		t.Error("Verified attestation even with multiple trust methods")
 	}
 }
 
-func TestVerifyAttestationEmptyRootsIntermediates(t *testing.T) {
+func TestValidateAK(t *testing.T) {
 	attestBytes := test.COS85NoNonce
 	att := &attestpb.Attestation{}
 	if err := proto.Unmarshal(attestBytes, att); err != nil {
 		t.Fatalf("failed to unmarshal attestation: %v", err)
 	}
 
-	if _, err := VerifyAttestation(att, VerifyOpts{
-		TrustedRootCerts:  nil,
-		IntermediateCerts: nil,
-	}); err == nil {
-		t.Error("expected error when calling VerifyAttestation with empty roots and intermediates")
+	rwc := test.GetTPM(t)
+	t.Cleanup(func() { client.CheckedClose(t, rwc) })
+
+	ak, err := client.AttestationKeyRSA(rwc)
+	if err != nil {
+		t.Fatalf("failed to generate AK: %v", err)
+	}
+	t.Cleanup(ak.Close)
+
+	testCases := []struct {
+		name     string
+		att      func() *attestpb.Attestation
+		opts     VerifyOpts
+		wantPass bool
+	}{
+		{
+			name: "success with validateAKCert",
+			att:  func() *attestpb.Attestation { return att },
+			opts: VerifyOpts{
+				TrustedRootCerts:  GceEKRoots,
+				IntermediateCerts: GceEKIntermediates,
+			},
+			wantPass: true,
+		},
+		{
+			name: "success with validateAKPub",
+			att: func() *attestpb.Attestation {
+				nonce := []byte("super secret nonce")
+				attestation, err := ak.Attest(client.AttestOpts{Nonce: nonce})
+				if err != nil {
+					t.Fatalf("failed to attest: %v", err)
+				}
+				return attestation
+			},
+			opts:     VerifyOpts{TrustedAKs: []crypto.PublicKey{ak.PublicKey()}},
+			wantPass: true,
+		},
+		{
+			name: "failed with empty roots and intermediates",
+			att:  func() *attestpb.Attestation { return att },
+			opts: VerifyOpts{
+				TrustedRootCerts:  nil,
+				IntermediateCerts: nil,
+			},
+			wantPass: false,
+		},
+		{
+			name:     "failed with empty VerifyOpts",
+			att:      func() *attestpb.Attestation { return att },
+			opts:     VerifyOpts{},
+			wantPass: false,
+		},
+		{
+			name:     "failed with missing roots",
+			att:      func() *attestpb.Attestation { return att },
+			opts:     VerifyOpts{IntermediateCerts: GceEKIntermediates},
+			wantPass: false,
+		},
+		{
+			name:     "failed with missing intermediates",
+			att:      func() *attestpb.Attestation { return att },
+			opts:     VerifyOpts{TrustedRootCerts: GceEKRoots},
+			wantPass: false,
+		},
+		{
+			name:     "failed with wrong trusted AKs",
+			att:      func() *attestpb.Attestation { return att },
+			opts:     VerifyOpts{TrustedAKs: []crypto.PublicKey{ak.PublicKey()}},
+			wantPass: false,
+		},
 	}
 
-	if _, err := VerifyAttestation(att, VerifyOpts{}); err == nil {
-		t.Error("expected error when calling VerifyAttestation with empty VerifyOpts")
-	}
-}
-
-func TestVerifyAttestationMissingRoots(t *testing.T) {
-	attestBytes := test.COS85NoNonce
-	att := &attestpb.Attestation{}
-	if err := proto.Unmarshal(attestBytes, att); err != nil {
-		t.Fatalf("failed to unmarshal attestation: %v", err)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, err := validateAK(tc.att(), tc.opts)
+			if gotPass := (err == nil); gotPass != tc.wantPass {
+				t.Errorf("ValidateAK failed, got pass %v, but want %v", gotPass, tc.wantPass)
+			}
+		})
 	}
 
-	if _, err := VerifyAttestation(att, VerifyOpts{
-		IntermediateCerts: GceEKIntermediates,
-	}); err == nil {
-		t.Error("expected error when calling VerifyAttestation with missing roots")
-	}
-}
-
-func TestVerifyAttestationMissingIntermediates(t *testing.T) {
-	attestBytes := test.COS85NoNonce
-	att := &attestpb.Attestation{}
-	if err := proto.Unmarshal(attestBytes, att); err != nil {
-		t.Fatalf("failed to unmarshal attestation: %v", err)
-	}
-
-	if _, err := VerifyAttestation(att, VerifyOpts{
-		TrustedRootCerts: GceEKRoots,
-	}); err == nil {
-		t.Error("expected error when calling VerifyAttestation with missing intermediates")
-	}
 }
 
 func TestVerifyIgnoreAKPubWithAKCert(t *testing.T) {
@@ -956,242 +745,91 @@ func TestGetInstanceInfoASN(t *testing.T) {
 	}
 }
 
-func TestVerifyAttestationWithSevSnp(t *testing.T) {
-
-	snpEventLog := test.CreateTpm2EventLog(4) // Enum 4- sev-snp
-	rwc := test.GetSimulatorWithLog(t, snpEventLog)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	nonce := []byte("super secret nonce")
-	altNonce := []byte("alternate secret nonce")
-	var nonce64 [64]byte
-	copy(nonce64[:], altNonce)
-	sevTestDevice, goodSnpRoot, badSnpRoot, kdsGetter := testclient.GetSevGuest([]sgtest.TestCase{
+func TestValidateAKGCEAndGetGCEInstanceInfo(t *testing.T) {
+	testCases := []struct {
+		name            string
+		certPEM         []byte
+		rootCertDER     []byte
+		intermediateDER []byte
+	}{
 		{
-			Input:  nonce64,
-			Output: sgtest.TestRawReport(nonce64),
-		},
-	}, &sgtest.DeviceOptions{Now: time.Now()}, t)
-	defer sevTestDevice.Close()
-	attestation, err := ak.Attest(client.AttestOpts{
-		Nonce:     nonce,
-		TEEDevice: &client.SevSnpDevice{Device: sevTestDevice},
-		TEENonce:  nonce64[:],
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-
-	type testCase struct {
-		name    string
-		opts    VerifyOpts
-		wantErr string
-	}
-	tcs := []testCase{
-		{
-			name: "Happy path",
-			opts: VerifyOpts{
-				Nonce:      nonce,
-				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-				TEEOpts: &VerifySnpOpts{
-					Validation: SevSnpDefaultValidateOptsForTest(altNonce),
-					Verification: &sv.Options{
-						Getter:       kdsGetter,
-						TrustedRoots: goodSnpRoot,
-					},
-				},
-			},
+			name:            "GCE UCA AK ECC",
+			certPEM:         test.GCESignECCCertUCA,
+			rootCertDER:     gceEKRootCA,
+			intermediateDER: gceEKIntermediateCA3,
 		},
 		{
-			name: "Wrong TEE nonce",
-			opts: VerifyOpts{
-				Nonce:      nonce,
-				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-				TEEOpts: &VerifySnpOpts{
-					Validation: SevSnpDefaultValidateOptsForTest([]byte("soooo baaad")),
-					Verification: &sv.Options{
-						Getter:       kdsGetter,
-						TrustedRoots: goodSnpRoot,
-					},
-				},
-			},
-			wantErr: "report field REPORT_DATA",
+			name:            "GCE UCA AK RSA",
+			certPEM:         test.GCESignRSACertUCA,
+			rootCertDER:     gceEKRootCA,
+			intermediateDER: gceEKIntermediateCA3,
 		},
 		{
-			name: "Bad sev root",
-			opts: VerifyOpts{
-				Nonce:      nonce,
-				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-				TEEOpts: &VerifySnpOpts{
-					Validation: SevSnpDefaultValidateOptsForTest(altNonce),
-					Verification: &sv.Options{
-						Getter:       kdsGetter,
-						TrustedRoots: badSnpRoot,
-					},
-				},
-			},
-			wantErr: "error verifying VCEK certificate",
+			name:            "GCE UCA EK ECC",
+			certPEM:         test.GCEEncryptECCCertUCA,
+			rootCertDER:     gceEKRootCA,
+			intermediateDER: gceEKIntermediateCA3,
+		},
+		{
+			name:            "GCE UCA EK RSA",
+			certPEM:         test.GCEEncryptRSACertUCA,
+			rootCertDER:     gceEKRootCA,
+			intermediateDER: gceEKIntermediateCA3,
+		},
+		{
+			name:            "GCE CAS AK ECC",
+			certPEM:         test.GCESignECCCertPCA,
+			rootCertDER:     gcpCASEKRootCA,
+			intermediateDER: gcpCASEKIntermediateCA3,
+		},
+		{
+			name:            "GCE CAS AK RSA",
+			certPEM:         test.GCESignRSACertPCA,
+			rootCertDER:     gcpCASEKRootCA,
+			intermediateDER: gcpCASEKIntermediateCA3,
+		},
+		{
+			name:            "GCE CAS EK ECC",
+			certPEM:         test.GCEEncryptECCCertPCA,
+			rootCertDER:     gcpCASEKRootCA,
+			intermediateDER: gcpCASEKIntermediateCA3,
+		},
+		{
+			name:            "GCE CAS EK RSA",
+			certPEM:         test.GCEEncryptRSACertPCA,
+			rootCertDER:     gcpCASEKRootCA,
+			intermediateDER: gcpCASEKIntermediateCA3,
 		},
 	}
-	// Production SEV VMs are not run with debug enabled, so this test must be skipped when the
-	// sev-guest device is passed in, indicating the test is running in a real SEV-SNP VM.
-	if sgclient.UseDefaultSevGuest() {
-		tcs = append(tcs, testCase{
-			name: "woops all debug",
-			opts: VerifyOpts{
-				Nonce:      nonce,
-				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-				TEEOpts: &VerifySnpOpts{
-					// The Debug bit is not set. If run in a production environment,
-					// this test will still pass validation and thus not fail
-					// in the expected way.
-					Validation: SevSnpDefaultValidateOpts(altNonce),
-					Verification: &sv.Options{
-						Getter:       kdsGetter,
-						TrustedRoots: goodSnpRoot,
-					},
-				},
-			},
-			wantErr: "found unauthorized debug capability",
-		})
-	}
-	for _, tc := range tcs {
+	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := VerifyAttestation(attestation, tc.opts); (err == nil && tc.wantErr != "") ||
-				(err != nil && !strings.Contains(err.Error(), tc.wantErr)) {
-				t.Errorf("VerifyAttestation(_, %v) = %v, want %q", tc.opts, err, tc.wantErr)
+			crtBlock, _ := pem.Decode(tc.certPEM)
+			if crtBlock.Bytes == nil {
+				t.Fatalf("failed to pem.Decode(tc.certPEM)")
 			}
-		})
-	}
-}
 
-func TestVerifyAttestationWithTdx(t *testing.T) {
-
-	tdxEventLog := test.CreateTpm2EventLog(3) // Enum 3-TDX
-	rwc := test.GetSimulatorWithLog(t, tdxEventLog)
-	defer client.CheckedClose(t, rwc)
-
-	ak, err := client.AttestationKeyRSA(rwc)
-	if err != nil {
-		t.Fatalf("failed to generate AK: %v", err)
-	}
-	defer ak.Close()
-
-	teeNonce := test.TdxReportData
-	tpmNonce := []byte("super secret nonce")
-	var teeNonce64 [64]byte
-	copy(teeNonce64[:], teeNonce)
-	mockTdxQuoteProvider := tgtestclient.GetMockTdxQuoteProvider([]tgtest.TestCase{
-		{
-			Input: teeNonce64,
-			Quote: tgtestdata.RawQuote,
-		},
-	}, t)
-	attestation, err := ak.Attest(client.AttestOpts{
-		Nonce:     tpmNonce,
-		TEEDevice: &client.TdxQuoteProvider{QuoteProvider: mockTdxQuoteProvider},
-		TEENonce:  teeNonce64[:],
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-	alterQuote1 := make([]byte, len(tgtestdata.RawQuote))
-	copy(alterQuote1[:], tgtestdata.RawQuote)
-	alterQuote1[0x1E] = 0x32
-	mockTdxQuoteProvider1 := tgtestclient.GetMockTdxQuoteProvider([]tgtest.TestCase{
-		{
-			Input: teeNonce64,
-			Quote: alterQuote1,
-		},
-	}, t)
-	attestation1, err := ak.Attest(client.AttestOpts{
-		Nonce:     tpmNonce,
-		TEEDevice: &client.TdxQuoteProvider{QuoteProvider: mockTdxQuoteProvider1},
-		TEENonce:  teeNonce64[:],
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-	alterQuote1[0x1024] = 0x32
-	mockTdxQuoteProvider2 := tgtestclient.GetMockTdxQuoteProvider([]tgtest.TestCase{
-		{
-			Input: teeNonce64,
-			Quote: alterQuote1,
-		},
-	}, t)
-	attestation2, err := ak.Attest(client.AttestOpts{
-		Nonce:     tpmNonce,
-		TEEDevice: &client.TdxQuoteProvider{QuoteProvider: mockTdxQuoteProvider2},
-		TEENonce:  teeNonce64[:],
-	})
-	if err != nil {
-		t.Fatalf("failed to attest: %v", err)
-	}
-	type testCase struct {
-		name    string
-		teeOpts VerifyTdxOpts
-		wantErr string
-		attest  *attestpb.Attestation
-	}
-	tcs := []testCase{
-		{
-			name: "Happy path",
-			teeOpts: VerifyTdxOpts{
-				Validation:   TdxDefaultValidateOpts(teeNonce),
-				Verification: tv.DefaultOptions(),
-			},
-			attest: attestation,
-		},
-		{
-			name: "Wrong TDX attestation quote",
-			teeOpts: VerifyTdxOpts{
-				Validation:   TdxDefaultValidateOpts(teeNonce),
-				Verification: tv.DefaultOptions(),
-			},
-			attest:  attestation1,
-			wantErr: "unable to verify message digest using quote's signature and ecdsa attestation key",
-		},
-		{
-			name: "Bad Roots Certificate",
-			teeOpts: VerifyTdxOpts{
-				Validation:   TdxDefaultValidateOpts(teeNonce),
-				Verification: tv.DefaultOptions(),
-			},
-			attest:  attestation2,
-			wantErr: "could not interpret Root CA certificate DER bytes: x509: invalid RDNSequence: invalid attribute value",
-		},
-		{
-			name: "Wrong TEE Nonce",
-			teeOpts: VerifyTdxOpts{
-				Validation:   TdxDefaultValidateOpts([]byte("badNonce")),
-				Verification: tv.DefaultOptions(),
-			},
-			attest:  attestation,
-			wantErr: "quote field REPORT_DATA",
-		},
-		{
-			name:    "Happy Path with empty TdxOpts",
-			attest:  attestation,
-			teeOpts: VerifyTdxOpts{},
-			wantErr: "options parameter is empty",
-		},
-	}
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			opts := VerifyOpts{
-				Nonce:      tpmNonce,
-				TrustedAKs: []crypto.PublicKey{ak.PublicKey()},
-				TEEOpts:    &tc.teeOpts,
+			akCrt, err := x509.ParseCertificate(crtBlock.Bytes)
+			if err != nil {
+				t.Fatalf("x509.ParseCertificate(crtBlock.Bytes): %v", err)
 			}
-			if _, err := VerifyAttestation(tc.attest, opts); (err == nil && tc.wantErr != "") ||
-				(err != nil && !strings.Contains(err.Error(), tc.wantErr)) {
-				t.Errorf("VerifyAttestation(_, %v) = %v, want %q", opts, err, tc.wantErr)
+			root, err := x509.ParseCertificate(tc.rootCertDER)
+			if err != nil {
+				t.Fatalf("x509.ParseCertificate(tc.rootCertDER): %v", err)
+			}
+			intermediate, err := x509.ParseCertificate(tc.intermediateDER)
+			if err != nil {
+				t.Fatalf("x509.ParseCertificate(tc.intermediateDER): %v", err)
+			}
+
+			if err := VerifyAKCert(akCrt, []*x509.Certificate{root}, []*x509.Certificate{intermediate}); err != nil {
+				t.Errorf("ValidateAKCert(%v): %v)", tc.name, err)
+			}
+
+			if gceInfo, err := GetGCEInstanceInfo(akCrt); err != nil {
+				t.Errorf("GetGCEInstanceInfo(akCrt): %v", err)
+			} else {
+				t.Log(gceInfo)
+				fmt.Print(gceInfo)
 			}
 		})
 	}
